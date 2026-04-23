@@ -1,52 +1,61 @@
 const AWS = require("aws-sdk");
-const winston = require("winston");
 
-// ================= CONFIG =================
-const REGION = process.env.AWS_REGION || "us-east-1";
-const BATCH_SIZE = 25; // DynamoDB limit
-const TABLE_PARALLELISM = 3;
-
-// ================= AWS SOURCE (REAL DYNAMODB) =================
-AWS.config.update({
+// ================= AWS SOURCE (REAL AWS) =================
+const aws = new AWS.DynamoDB({
   region: process.env.AWS_REGION,
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
 });
 
-const dynamo = new AWS.DynamoDB();
-const docClient = new AWS.DynamoDB.DocumentClient();
+const docClient = new AWS.DynamoDB.DocumentClient({
+  region: process.env.AWS_REGION,
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+});
 
-// ================= RAILWAY TARGET DYNAMODB =================
-const railwayDB = new AWS.DynamoDB.DocumentClient({
+// ================= RAILWAY TARGET (NO AWS SIGNING) =================
+const railway = new AWS.DynamoDB.DocumentClient({
   endpoint: process.env.RAILWAY_DYNAMODB_URL,
   region: process.env.AWS_REGION || "us-east-1",
-  accessKeyId: "dummy",
-  secretAccessKey: "dummy",
-  sslEnabled: false,
+  convertEmptyValues: true,
 });
 
-// ================= LOGGER =================
-const logger = winston.createLogger({
-  level: "info",
-  format: winston.format.simple(),
-  transports: [new winston.transports.Console()],
+// Raw client for table operations
+const railwayRaw = new AWS.DynamoDB({
+  endpoint: process.env.RAILWAY_DYNAMODB_URL,
+  region: process.env.AWS_REGION || "us-east-1",
+  convertEmptyValues: true,
 });
 
-// ================= LIST TABLES =================
-async function getTables() {
-  let tables = [];
-  let params = {};
-
-  do {
-    const data = await dynamo.listTables(params).promise();
-    tables = tables.concat(data.TableNames);
-    params.ExclusiveStartTableName = data.LastEvaluatedTableName;
-  } while (params.ExclusiveStartTableName);
-
-  return tables;
+// ================= CHECK TABLE =================
+async function tableExists(tableName) {
+  try {
+    await railwayRaw.describeTable({ TableName: tableName }).promise();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-// ================= SCAN TABLE =================
+// ================= CREATE TABLE =================
+async function createTableFromAWS(tableName) {
+  const table = await aws.describeTable({ TableName: tableName }).promise();
+  const schema = table.Table;
+
+  await railwayRaw.createTable({
+    TableName: schema.TableName,
+    KeySchema: schema.KeySchema,
+    AttributeDefinitions: schema.AttributeDefinitions,
+    ProvisionedThroughput: {
+      ReadCapacityUnits: 5,
+      WriteCapacityUnits: 5,
+    },
+  }).promise();
+
+  console.log("🆕 Created:", tableName);
+}
+
+// ================= SCAN AWS =================
 async function scanTable(tableName) {
   let items = [];
   let params = { TableName: tableName };
@@ -60,63 +69,47 @@ async function scanTable(tableName) {
   return items;
 }
 
-// ================= WRITE TO RAILWAY =================
-async function writeToRailway(tableName, items) {
-  for (let i = 0; i < items.length; i += BATCH_SIZE) {
-    const batch = items.slice(i, i + BATCH_SIZE);
+// ================= COPY TO RAILWAY =================
+async function copyData(tableName, items) {
+  const BATCH = 25;
 
-    const params = {
+  for (let i = 0; i < items.length; i += BATCH) {
+    const batch = items.slice(i, i + BATCH);
+
+    await railway.batchWrite({
       RequestItems: {
         [tableName]: batch.map(item => ({
-          PutRequest: {
-            Item: item,
-          },
-        })),
-      },
-    };
-
-    await railwayDB.batchWrite(params).promise();
-    logger.info(`✔ Copied ${batch.length} items → ${tableName}`);
+          PutRequest: { Item: item }
+        }))
+      }
+    }).promise();
   }
-}
-
-// ================= PROCESS TABLE =================
-async function processTable(tableName) {
-  logger.info(`🚀 Processing ${tableName}`);
-
-  const items = await scanTable(tableName);
-  logger.info(`Fetched ${items.length} items from ${tableName}`);
-
-  await writeToRailway(tableName, items);
-
-  logger.info(`✅ Done ${tableName}`);
 }
 
 // ================= MAIN =================
 async function run() {
-  try {
-    const tables = await getTables();
-    logger.info(`Found ${tables.length} tables`);
+  const tables = await aws.listTables().promise();
 
-    const queue = [...tables];
+  for (const tableName of tables.TableNames) {
+    console.log("\n🚀 Processing:", tableName);
 
-    const workers = new Array(TABLE_PARALLELISM).fill(null).map(async () => {
-      while (queue.length > 0) {
-        const table = queue.shift();
-        try {
-          await processTable(table);
-        } catch (err) {
-          logger.error(`❌ Error ${table}:`, err.message);
-        }
-      }
-    });
+    const exists = await tableExists(tableName);
 
-    await Promise.all(workers);
+    if (!exists) {
+      console.log("⚠️ Creating table in Railway...");
+      await createTableFromAWS(tableName);
+    }
 
-    logger.info("🎉 Migration completed successfully");
-  } catch (err) {
-    logger.error("💥 Migration failed:", err);
+    const items = await scanTable(tableName);
+
+    console.log("📦 Items:", items.length);
+
+    await copyData(tableName, items);
+
+    console.log("✅ Done:", tableName);
   }
+
+  console.log("\n🎉 FULL COPY COMPLETED");
 }
 
 run();
