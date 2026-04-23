@@ -1,0 +1,24 @@
+{
+  "name": "aws-ddb-to-railway-ddb",
+  "version": "1.0.0",
+  "main": "copy.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saihari1/new-ddb.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/saihari1/new-ddb/issues"
+  },
+  "homepage": "https://github.com/saihari1/new-ddb#readme",
+  "description": "",
+  "dependencies": {
+    "aws-sdk": "^2.1693.0",
+    "winston": "^3.19.0"
+  }
+}
